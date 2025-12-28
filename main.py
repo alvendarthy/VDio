@@ -7,7 +7,7 @@ import threading
 import shutil
 import re
 import sys
-import json  # --- Modification: Added JSON support ---
+import json
 
 # --- 1. Import pywinstyles for Frosted Glass ---
 try:
@@ -112,7 +112,7 @@ class DownloadApp(ctk.CTk):
         # Bind Double Click to Open Directory
         self.save_entry.bind("<Double-Button-1>", self.open_save_directory)
 
-        # Default path (will be overwritten if config exists)
+        # Default path
         default_path = str(Path.home() / "Downloads")
         self.save_entry.insert(0, default_path)
 
@@ -142,37 +142,30 @@ class DownloadApp(ctk.CTk):
         )
         self.download_btn.grid(row=4, column=0, columnspan=3, sticky="ew", padx=80, pady=(10, 30))
 
-        # --- Modification: Load Config at Startup ---
+        # --- Load Config at Startup ---
         self.load_config()
 
     # --- Config Methods ---
     def get_config_path(self):
-        """Returns the path to config.json in the script's directory."""
         return Path(__file__).parent / "config.json"
 
     def load_config(self):
-        """Loads the save path from config.json if it exists."""
         try:
             config_file = self.get_config_path()
             if config_file.exists():
                 with open(config_file, "r", encoding="utf-8") as f:
                     data = json.load(f)
                     saved_path = data.get("save_path", "")
-                    
-                    # Verify the path still exists
                     if saved_path and os.path.isdir(saved_path):
                         self.save_entry.delete(0, "end")
                         self.save_entry.insert(0, saved_path)
                         self.log(f"Config: Restored save path.")
         except Exception as e:
-            # Silent fail on config load, just log it
             print(f"Config Load Error: {e}")
 
     def save_config(self):
-        """Saves the current save path to config.json."""
         try:
             current_path = self.save_entry.get().strip()
-            # Only save if it is a valid directory
             if current_path and os.path.isdir(current_path):
                 config_file = self.get_config_path()
                 with open(config_file, "w", encoding="utf-8") as f:
@@ -221,7 +214,6 @@ class DownloadApp(ctk.CTk):
         if selected:
             self.save_entry.delete(0, "end")
             self.save_entry.insert(0, selected)
-            # --- Modification: Save config on browse ---
             self.save_config()
 
     def log(self, message):
@@ -242,8 +234,6 @@ class DownloadApp(ctk.CTk):
             messagebox.showerror("Error", "yt-dlp is not installed or not in PATH.")
             return
 
-        # --- Modification: Save config before downloading ---
-        # This captures cases where user manually typed a valid path
         self.save_config()
 
         self.download_btn.configure(state="disabled", text="Checking...")
@@ -254,7 +244,7 @@ class DownloadApp(ctk.CTk):
         thread = threading.Thread(target=self.run_download, args=(url, save_dir))
         thread.start()
 
-    def run_download(self, url, save_dir):
+    def run_download(self, url, root_save_dir):
         # Configuration to hide console window on Windows
         startupinfo = None
         if os.name == 'nt':
@@ -262,10 +252,9 @@ class DownloadApp(ctk.CTk):
             startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
 
         try:
-            # --- PHASE 1: Get Video Title for Checking ---
+            # --- PHASE 1: Get Video Title ---
             self.log("Fetching video title...")
             
-            # Command to get title
             title_cmd = ["yt-dlp", "--get-title", url, "--no-warnings"]
             
             proc_title = subprocess.run(
@@ -285,53 +274,75 @@ class DownloadApp(ctk.CTk):
                 self.log(f"Title: {video_title}")
             else:
                 self.log(f"Warning: Could not fetch title. {proc_title.stderr.strip()}")
+                # Fallback: if we can't get title, we cannot make a named folder.
+                # proceed to standard download in root dir? Or abort?
+                # Let's abort to be safe, or just use a fallback folder name.
+                self.log("Aborting: Cannot verify title for folder creation.")
+                return
 
-            # --- PHASE 2: Check Existing Files and DELETE if requested ---
-            if video_title and os.path.exists(save_dir):
-                # Regex logic: Title + . + Ext
-                pattern_str = r"^" + re.escape(video_title) + r"\..+$"
-                regex_pattern = re.compile(pattern_str)
+            # --- PHASE 2: Create Subdirectory & Check Existing ---
+            
+            # Sanitize title for valid folder name (replace illegal chars with _)
+            safe_title = re.sub(r'[<>:"/\\|?*]', '_', video_title)
+            
+            # This is the dedicated directory for this video
+            video_save_dir = os.path.join(root_save_dir, safe_title)
 
-                found_files = []
+            # Ensure the directory exists
+            if not os.path.exists(video_save_dir):
                 try:
-                    for filename in os.listdir(save_dir):
-                        if regex_pattern.match(filename):
-                            found_files.append(filename)
+                    os.makedirs(video_save_dir, exist_ok=True)
+                    self.log(f"Created directory: {safe_title}")
                 except Exception as e:
-                    self.log(f"Error scanning directory: {e}")
+                    self.log(f"Error creating directory: {e}")
+                    return
+            else:
+                self.log(f"Directory exists: {safe_title}")
 
-                if found_files:
-                    # Construct warning message
-                    msg_txt = f"Found {len(found_files)} existing file(s) matching title:\n"
-                    for f in found_files[:3]:
-                        msg_txt += f"• {f}\n"
-                    if len(found_files) > 3:
-                        msg_txt += f"...and {len(found_files)-3} others."
-                    
-                    msg_txt += "\n\nDo you want to DELETE these files and download again?"
-                    
-                    self.log(f"Conflict: {len(found_files)} existing file(s) found.")
-                    
-                    # Ask User
-                    user_resp = messagebox.askyesno("File Exists", msg_txt)
-                    
-                    if not user_resp:
-                        self.log("Download Cancelled by user.")
-                        return
-                    else:
-                        # --- REMOVE FILES LOGIC ---
-                        self.log("Removing existing files...")
-                        for f in found_files:
-                            try:
-                                full_path = os.path.join(save_dir, f)
-                                os.remove(full_path)
-                                self.log(f"Deleted: {f}")
-                            except Exception as e:
-                                self.log(f"Error deleting {f}: {e}")
+            # Now we check inside 'video_save_dir' for duplicates
+            # Regex logic: Match files starting with the title inside that folder
+            pattern_str = r"^" + re.escape(video_title) + r"\..+$"
+            regex_pattern = re.compile(pattern_str)
+
+            found_files = []
+            try:
+                for filename in os.listdir(video_save_dir):
+                    if regex_pattern.match(filename):
+                        found_files.append(filename)
+            except Exception as e:
+                self.log(f"Error scanning directory: {e}")
+
+            if found_files:
+                msg_txt = f"Found {len(found_files)} existing file(s) in '{safe_title}':\n"
+                for f in found_files[:3]:
+                    msg_txt += f"• {f}\n"
+                if len(found_files) > 3:
+                    msg_txt += f"...and {len(found_files)-3} others."
+                
+                msg_txt += "\n\nDo you want to DELETE these files and download again?"
+                
+                self.log(f"Conflict: {len(found_files)} existing file(s) found.")
+                
+                user_resp = messagebox.askyesno("File Exists", msg_txt)
+                
+                if not user_resp:
+                    self.log("Download Cancelled by user.")
+                    return
+                else:
+                    self.log("Removing existing files...")
+                    for f in found_files:
+                        try:
+                            full_path = os.path.join(video_save_dir, f)
+                            os.remove(full_path)
+                            self.log(f"Deleted: {f}")
+                        except Exception as e:
+                            self.log(f"Error deleting {f}: {e}")
 
             # --- PHASE 3: Download ---
             self.download_btn.configure(text="Downloading...")
-            output_template = f"{save_dir}/%(title)s.%(ext)s"
+            
+            # Update output template to point to the NEW video_save_dir
+            output_template = f"{video_save_dir}/%(title)s.%(ext)s"
             command = ["yt-dlp", url, "-o", output_template]
             
             self.log(f"Starting Download...")
@@ -358,7 +369,6 @@ class DownloadApp(ctk.CTk):
                 self.log(f"Error: Process finished with code {return_code}")
             else:
                 self.log("Download Completed Successfully!")
-                # Silent success (no popup)
 
         except Exception as e:
             self.after(0, lambda: messagebox.showerror("Error", str(e)))
